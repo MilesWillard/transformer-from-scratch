@@ -2,8 +2,12 @@ import Transformer
 import torch
 from torch import nn
 from tokenizers import Tokenizer
+from pathlib import Path
 
-START_FROM = 50
+EXPERIMENT = 'Dropout'  #Name of the save file in weights. None defaults to the last file created
+
+USE_WEIGHTS = 'best' #best of experiment ("best"), or final output of experiment ("last")
+
 
 CONTEXT = 512
 
@@ -17,8 +21,6 @@ elif torch.backends.mps.is_available():
     device = torch.device("mps")
 else:
     device = torch.device("cpu")
-    
-#torch.manual_seed(2)
 
 def get_input():
     text = input('Enter text: ')
@@ -31,7 +33,7 @@ def main():
     softmax = Transformer.SoftMax.apply
     model = Transformer.Transformer().to(device)
     model.to(dtype=dt)
-    model.load_state_dict(torch.load(f'data/weights/weights_epoch{START_FROM}.pth', map_location=device,weights_only=True))
+    model.load_state_dict(torch.load(f'data/weights/{EXPERIMENT}_{USE_WEIGHTS}.pth', map_location=device, weights_only=True))
     model.eval()
     INPUT, word = get_input()
     INPUT = INPUT.unsqueeze(0)

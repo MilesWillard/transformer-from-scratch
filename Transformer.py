@@ -9,6 +9,7 @@ HEADS = 4
 DK = 32
 DV = 32
 HIDDEN = [512]
+DROPOUT_PROB = .1
 
 class RMSNorm(torch.autograd.Function):
     @staticmethod
@@ -70,7 +71,7 @@ class PositionalEncoding(nn.Module):
         angles = positions / (10000.0 ** (2 * (dimensions // 2) / dim))
         pe = torch.where(dimensions % 2 == 0, torch.sin(angles), torch.cos(angles))
         
-        return (x * math.sqrt(dim)) + pe.to(dtype=x.dtype)
+        return (x*math.sqrt(dim)) + pe.to(dtype=x.dtype)
     
 class QKVProjection(torch.autograd.Function):
     @staticmethod
@@ -146,21 +147,22 @@ class Linear(nn.Module):
             return y
         
 class MaskedAttention(nn.Module):
-    def __init__(self,heads,dim,dk,dv):
+    def __init__(self,heads,dim,dk,dv,dropout_prob):
         super().__init__()
         self.dk = dk
         self.dv = dv
         self.heads = heads
-        self.w_q = nn.Parameter(torch.randn((heads,dim,dk)))
-        self.w_k = nn.Parameter(torch.randn((heads,dim,dk)))
-        self.w_v = nn.Parameter(torch.randn((heads,dim,dv)))
-        self.w_o = nn.Parameter(torch.randn((heads*dv,dim)))
+        self.w_q = nn.Parameter(torch.empty((heads,dim,dk)))
+        self.w_k = nn.Parameter(torch.empty((heads,dim,dk)))
+        self.w_v = nn.Parameter(torch.empty((heads,dim,dv)))
+        self.w_o = nn.Parameter(torch.empty((heads*dv,dim)))
         nn.init.xavier_uniform_(self.w_q)
         nn.init.xavier_uniform_(self.w_k)
         nn.init.xavier_uniform_(self.w_v)
         nn.init.xavier_uniform_(self.w_o)
         self.QKV_projection = QKVProjection.apply
         self.softmax = SoftMax.apply
+        self.dropout = torch.nn.Dropout(dropout_prob)
         
     def forward(self,x):
         Q,K,V = self.QKV_projection(x,self.w_q,self.w_k,self.w_v)
@@ -170,7 +172,7 @@ class MaskedAttention(nn.Module):
         scores = (Q @ torch.transpose(K, -2, -1)) / sqrt
         mask = torch.triu(torch.ones_like(scores), diagonal=1).bool()
         scores = scores.masked_fill(mask, float("-inf"))
-        QKV = self.softmax(scores) @ V
+        QKV = self.dropout(self.softmax(scores)) @ V
         QKV = QKV.transpose(1, 2).contiguous().view(batch_size, context, -1)
         return QKV @ self.w_o
     
@@ -192,32 +194,34 @@ class FeedForward(nn.Module):
         return x
 
 class TransformerBlock(nn.Module):
-    def __init__(self,dim,heads,dk,dv,hidden):
+    def __init__(self,dim,heads,dk,dv,hidden,dropout_prob):
         super().__init__()
         self.RMS1 = RMSNormed(dim)
         self.RMS2 = RMSNormed(dim)
-        self.attention = MaskedAttention(heads,dim,dk,dv)
+        self.attention = MaskedAttention(heads,dim,dk,dv,dropout_prob)
         self.feed_forward = FeedForward(dim,hidden)
+        self.dropout = torch.nn.Dropout(dropout_prob)
         
     def forward(self,x):
-        x = self.attention(self.RMS1(x)) + x
-        x = self.feed_forward(self.RMS2(x)) + x
+        x = self.dropout(self.attention(self.RMS1(x))) + x
+        x = self.dropout(self.feed_forward(self.RMS2(x))) + x
         return x
     
 class Transformer(nn.Module):
-    def __init__(self,tokens=TOKENS,dim=DIM,layers=LAYERS,heads=HEADS,dk=DK,dv=DV,hidden=HIDDEN):
+    def __init__(self,tokens=TOKENS,dim=DIM,layers=LAYERS,heads=HEADS,dk=DK,dv=DV,hidden=HIDDEN,dropout_prob=DROPOUT_PROB):
         super().__init__()
         self.pe = PositionalEncoding()
-        self.blocks = nn.ModuleList([TransformerBlock(dim,heads,dk,dv,hidden) for i in range(layers)])
-        self.softmax = SoftMax.apply
+        self.blocks = nn.ModuleList([TransformerBlock(dim,heads,dk,dv,hidden,dropout_prob) for i in range(layers)])
         self.RMS = RMSNormed(dim)
         self.embed = Embedding(tokens,dim)
+        self.dropout = torch.nn.Dropout(dropout_prob)
         self.decode = Linear(dim,tokens,bias=False)
                
         
     def forward(self,x):
         x = self.embed(x)
         x = self.pe(x)
+        x = self.dropout(x)
         for block in self.blocks:
             x = block(x)
         x = self.RMS(x)

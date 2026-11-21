@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from tokenizers import Tokenizer
 
+from pathlib import Path
 import argparse
 import csv
 import json
@@ -14,12 +15,14 @@ import matplotlib
 matplotlib.use("Agg")  # save plots to disk instead of opening a window (plt.show() would block an overnight run)
 import matplotlib.pyplot as plt
 
-START_FROM = 0
+EXPERIMENT = 'Random window batching' #Name of the save file in log.
+
+START_FROM = None  # start the run from random weights (none), best of experiment ("best"), or final output of experiment ("last")
 
 CONTEXT = 512
 BATCH_SIZE = 100
 STEPS = 3000
-LEARNING_RATE = 1e-3
+MAX_LEARNING_RATE = 1e-3
 
 EVAL_INTERVAL = 50      # evaluate every N optimizer steps (plus step 0 and the final step)
 TRAIN_EVAL_SEQS = 50    # fixed slice of training sequences, evaluated in eval mode, for a noise-free train curve
@@ -75,9 +78,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--max-lr", type=float, default=MAX_LEARNING_RATE)
     parser.add_argument("--eval-interval", type=int, default=EVAL_INTERVAL)
-    parser.add_argument("--run-name", type=str, default=time.strftime("run_%Y%m%d_%H%M%S"))
+    parser.add_argument("--run-name", type=str, default=EXPERIMENT)
     args = parser.parse_args()
 
     run_dir = os.path.join("log", args.run_name)
@@ -92,15 +95,15 @@ def main():
 
     model = Transformer.Transformer().to(device)
     model.to(dtype=dt)
-    if START_FROM > 0:
-        model.load_state_dict(torch.load(f'data/weights/weights_epoch{START_FROM}.pth', map_location=device, weights_only=True))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=.01)
+    if START_FROM:
+        model.load_state_dict(torch.load(f'data/weights/{EXPERIMENT}_{START_FROM}.pth', map_location=device, weights_only=True))
+    optimizer = torch.optim.AdamW(model.parameters(), 0, weight_decay=.01)
 
     n_params = sum(p.numel() for p in model.parameters())
     steps_per_epoch = math.ceil(INPUT.size(0) / args.batch_size)
     config = {
         "run_name": args.run_name, "device": str(device), "params": n_params,
-        "context": CONTEXT, "batch_size": args.batch_size, "steps": args.steps, "lr": args.lr,
+        "context": CONTEXT, "batch_size": args.batch_size, "steps": args.steps, "max_lr": args.max_lr,
         "weight_decay": 0.01, "eval_interval": args.eval_interval, "start_from": START_FROM,
         "train_sequences": INPUT.size(0), "val_sequences": VAL_INPUT.size(0),
         "train_tokens": INPUT.numel(), "val_tokens": VAL_INPUT.numel(),
@@ -134,6 +137,13 @@ def main():
             best_val = val_loss
             torch.save(model.state_dict(), f'data/weights/{args.run_name}_best.pth')
         print(f"[eval] step {step} | val {val_loss:.4f} (ppl {math.exp(val_loss):.1f}, bpb {val_bpb:.3f}) | train(eval) {train_eval_loss:.4f}", flush=True)
+    
+    def lr_decay(step,max_steps,max_lr):
+        if step < .05*max_steps:
+            return max_lr/(int(.05*max_steps)) * step
+        else:
+            t = (step-int(.05*max_steps))/(max_steps-int(.05*max_steps)-1)
+            return 1/2*max_lr*(1+math.cos(math.pi*t))
 
     model.train()
     num_of_steps = 0
@@ -151,6 +161,7 @@ def main():
                 stop = True
                 break
             t0 = time.time()
+            optimizer.param_groups[0]['lr'] = lr_decay(num_of_steps,args.steps,args.max_lr)
             logits = model(INPUT[j:j+args.batch_size])
             loss = torch.nn.functional.cross_entropy(logits.permute(0, 2, 1), TARGET[j:j+args.batch_size])
             model.zero_grad()
@@ -168,7 +179,7 @@ def main():
                 run_eval(num_of_steps, epoch + 1)
         if k > 0:
             epoch += 1
-            print(f"average loss over epoch {START_FROM+epoch}: {epoch_loss/k:.4f} (step {num_of_steps})", flush=True)
+            print(f"average loss over epoch {epoch}: {epoch_loss/k:.4f} (step {num_of_steps})", flush=True)
             torch.save(model.state_dict(), f'data/weights/{args.run_name}_last.pth')
 
     train_f.close()

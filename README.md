@@ -1,6 +1,6 @@
 # A transformer language model built from first principles
 
-A small decoder-only transformer written in PyTorch, where the core operations have hand-derived backward passes instead of relying on autograd. I trained it on the complete works of Shakespeare on a MacBook.
+A small decoder-only transformer written in PyTorch, where the core operations have hand-derived backward passes instead of relying on autograd. I trained it on the complete works of Shakespeare, first on a MacBook and now on an RTX 5070.
 
 The goal was to understand every piece of a modern language model well enough to write it myself: attention, normalization, positional encoding, the training loop and the diagnostics that show whether training worked.
 
@@ -17,7 +17,7 @@ The goal was to understand every piece of a modern language model well enough to
 | Activation | Softplus ("smooth ReLU") with a **hand-written backward pass** |
 | Positional encoding | Sinusoidal |
 | Tokenizer | Byte-level BPE, 2,000-token vocabulary (Hugging Face `tokenizers`) |
-| Training | AdamW, periodic evaluation, best/last checkpointing, CSV logs, loss plots |
+| Training | AdamW, LR warmup + cosine decay, dropout, periodic evaluation, best/last checkpointing, CSV logs, loss plots |
 | Inference | Temperature sampling |
 
 Each custom op is a `torch.autograd.Function` whose `backward` I derived on paper. For example, for RMSNorm y = γ · x / rms(x), the input gradient is
@@ -26,7 +26,7 @@ Each custom op is a `torch.autograd.Function` whose `backward` I derived on pape
 dL/dx = (g·γ) / rms  −  x · Σ(g·γ·x) / (d · rms³)
 ```
 
-## Results
+## First run
 
 Model: 1.30M parameters (4 layers, width 128, 512-token context). Data: 1.78M training tokens, 30k validation tokens. Training took 2 h 16 min on Apple Silicon (MPS) at about 19k tokens/s.
 
@@ -43,14 +43,28 @@ Model: 1.30M parameters (4 layers, width 128, 512-token context). Data: 1.78M tr
 
 ![Train-validation gap](assets/train_val_gap.png)
 
-## Next experiments
+## Experiments since the first run
 
-1. Early stopping on validation loss
-2. More training data
-3. Dropout and weight decay that excludes norm gains
-4. Learning-rate warmup and cosine decay
-5. Weight tying between the input embedding and output layer (~39% of parameters are in those two tables)
-6. Benchmark the custom ops against PyTorch's fused `scaled_dot_product_attention`
+Same model and data, 3,000 steps each, now trained on an RTX 5070 (CUDA): the same run takes about 10 minutes there, against 2 h 16 min on the MacBook.
+
+| Run | Best validation loss | Final train–val gap |
+|---|---|---|
+| Baseline (constant LR) | 3.704 | 0.75 |
+| + LR warmup and cosine decay | 3.706 | 0.43 |
+| + Dropout 0.1 (attention and residual) | **3.673** | **0.21** |
+
+Warmup and cosine decay barely moved the best validation loss. Dropout gave the best result so far and cut the overfitting gap by more than two thirds, so it's now on by default. I also tried tying the input embedding and output layer weights; at this size it made results noticeably worse, so I've left it out for now and will retry it at GPT-2 scale.
+
+## Current work
+
+**Now:** finishing the Shakespeare model. Next up are random-window batching (sampling `(batch, context)` windows at random offsets instead of fixed chunks, as a cheap regularizer on such a small dataset), gradient clipping, a byte-level tokenizer alphabet so unseen characters never break encoding, a `tests/` script (gradcheck on every custom op, tokenizer round-trip, causal-mask check), and saving text samples with each run.
+
+**Roadmap:** I'm working through a staged plan from this model toward a modern LLM:
+
+1. **The GPT recipe:** my own BPE tokenizer, a GPT-2 small (124M) model trained on FineWeb-Edu on the 5070
+2. **Scaling laws:** a small-model sweep, fitted loss curves, μP
+3. **Llama-style block:** SwiGLU, RoPE, grouped-query attention, KV cache
+4. **Speed and long context:** profiling, FlashAttention, the Muon optimizer
 
 ## Files
 
@@ -58,7 +72,6 @@ Model: 1.30M parameters (4 layers, width 128, 512-token context). Data: 1.78M tr
 |---|---|
 | `Transformer.py` | Model and custom autograd functions |
 | `Training.py` | Training loop, evaluation, logging, checkpoints |
-| `Validation.py` | Evaluate a saved checkpoint |
 | `Inference.py` | Generate text from a prompt |
 | `byte_pair_encoding.py` | Train the BPE tokenizer |
 
