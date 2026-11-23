@@ -13,20 +13,26 @@ DROPOUT_PROB = .1
 
 class RMSNorm(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, gamma, eps=1e-6):
+    def forward(x, gamma, eps=1e-6):
         rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-        ctx.save_for_backward(x, gamma, rms)
-        return x / rms * gamma
+        return x / rms * gamma, rms
+    
+    @staticmethod
+    def setup_context(ctx,inputs,outputs):
+        out,rms = outputs
+        x, gamma = inputs[:2]
+        ctx.save_for_backward(x,gamma,rms)
+        ctx.mark_non_differentiable(rms)
 
     @staticmethod
-    def backward(ctx, g):
+    def backward(ctx, g, g_rms):
         x, gamma, rms = ctx.saved_tensors
         d = x.size(-1)
         gg = g * gamma
         grad_x = gg / rms - x * (gg * x).sum(-1, keepdim=True) / (d * rms**3)
         grad_gamma = (g * x / rms).reshape(-1, d).sum(0).reshape(gamma.shape)
         return grad_x, grad_gamma, None
-
+    
 class SmoothReLU(torch.autograd.Function):
     @staticmethod
     def forward(x):
@@ -44,22 +50,19 @@ class SmoothReLU(torch.autograd.Function):
     
 class SoftMax(torch.autograd.Function):
     @staticmethod
-    def forward(x,dim=-1):
-        shifted = x - torch.max(x,dim=dim,keepdim=True).values
+    def forward(x):
+        shifted = x - torch.max(x,dim=-1,keepdim=True).values
         exp_x = torch.exp(shifted)
-        return exp_x/torch.sum(exp_x,dim=dim,keepdim=True)
+        return exp_x/torch.sum(exp_x,dim=-1,keepdim=True)
     
     @staticmethod
     def setup_context(ctx,inputs,outputs):
-        dim = inputs[1]
         ctx.save_for_backward(outputs)
-        ctx.dim = dim
         
     @staticmethod
     def backward(ctx,grad_out):
         output, = ctx.saved_tensors
-        dim = ctx.dim
-        grad_input = output * (grad_out - (grad_out * output).sum(dim=dim, keepdim=True))
+        grad_input = output * (grad_out - (grad_out * output).sum(dim=-1, keepdim=True))
         return grad_input, None
     
 class PositionalEncoding(nn.Module):
@@ -116,19 +119,18 @@ class Embedding(nn.Module):
         super().__init__()
         self.weights = nn.Parameter(torch.empty((tokens,dim)))
         nn.init.normal_(self.weights,mean=0,std=.02)
-        self.embed = Embed.apply
     
     def forward(self,x):
-        return self.embed(self.weights,x)
+        return Embed.apply(self.weights,x)
     
 class RMSNormed(nn.Module):
     def __init__(self,dim):
         super().__init__()
-        self.RMS = RMSNorm.apply
         self.gamma = nn.Parameter(torch.ones((1,dim)))
         
     def forward(self,x):
-        return self.RMS(x,self.gamma)
+        y, _ = RMSNorm.apply(x,self.gamma)
+        return y
 
 class Linear(nn.Module):
     def __init__(self, in_dim, out_dim,bias=True):
@@ -160,19 +162,17 @@ class MaskedAttention(nn.Module):
         nn.init.xavier_uniform_(self.w_k)
         nn.init.xavier_uniform_(self.w_v)
         nn.init.xavier_uniform_(self.w_o)
-        self.QKV_projection = QKVProjection.apply
-        self.softmax = SoftMax.apply
         self.dropout = torch.nn.Dropout(dropout_prob)
         
     def forward(self,x):
-        Q,K,V = self.QKV_projection(x,self.w_q,self.w_k,self.w_v)
+        Q,K,V = QKVProjection.apply(x,self.w_q,self.w_k,self.w_v)
         batch_size = Q.size()[0]
         context = Q.size()[2]
         sqrt = math.sqrt(self.dk)
         scores = (Q @ torch.transpose(K, -2, -1)) / sqrt
         mask = torch.triu(torch.ones_like(scores), diagonal=1).bool()
         scores = scores.masked_fill(mask, float("-inf"))
-        QKV = self.dropout(self.softmax(scores)) @ V
+        QKV = self.dropout(SoftMax.apply(scores)) @ V
         QKV = QKV.transpose(1, 2).contiguous().view(batch_size, context, -1)
         return QKV @ self.w_o
     
@@ -182,14 +182,13 @@ class FeedForward(nn.Module):
         self.start = Linear(dim,hidden[0])
         self.linears = nn.ModuleList([Linear(hidden[i],hidden[i+1]) for i in range(len(hidden)-1)])
         self.end = Linear(hidden[-1],dim)
-        self.smooth_relu = SmoothReLU.apply
     
     def forward(self,x):
         x = self.start(x)
-        x = self.smooth_relu(x)
+        x = SmoothReLU.apply(x)
         for linear in self.linears:
             x = linear(x)
-            x = self.smooth_relu(x)
+            x = SmoothReLU.apply(x)
         x = self.end(x)
         return x
 

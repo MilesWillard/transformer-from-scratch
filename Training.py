@@ -1,4 +1,5 @@
 import Transformer
+import logging
 import torch
 from torch import nn
 from tokenizers import Tokenizer
@@ -15,7 +16,9 @@ import matplotlib
 matplotlib.use("Agg")  # save plots to disk instead of opening a window (plt.show() would block an overnight run)
 import matplotlib.pyplot as plt
 
-EXPERIMENT = 'Random window batching' #Name of the save file in log.
+torch._logging.set_logs(inductor=logging.ERROR)
+
+EXPERIMENT = 'Speed' #Name of the save file in log.
 
 START_FROM = None  # start the run from random weights (none), best of experiment ("best"), or final output of experiment ("last")
 
@@ -26,6 +29,8 @@ MAX_LEARNING_RATE = 1e-3
 
 EVAL_INTERVAL = 50      # evaluate every N optimizer steps (plus step 0 and the final step)
 TRAIN_EVAL_SEQS = 50    # fixed slice of training sequences, evaluated in eval mode, for a noise-free train curve
+
+SEED = 70
 
 dt = torch.float32
 
@@ -38,7 +43,7 @@ elif torch.backends.mps.is_available():
 else:
     device = torch.device("cpu")
 
-torch.manual_seed(70)
+torch.manual_seed(SEED)
 
 def token_batches(file, context):
     with open(file, 'r') as f:
@@ -95,6 +100,7 @@ def main():
 
     model = Transformer.Transformer().to(device)
     model.to(dtype=dt)
+    model = torch.compile(model)
     if START_FROM:
         model.load_state_dict(torch.load(f'data/weights/{EXPERIMENT}_{START_FROM}.pth', map_location=device, weights_only=True))
     optimizer = torch.optim.AdamW(model.parameters(), 0, weight_decay=.01)
@@ -106,10 +112,10 @@ def main():
         "context": CONTEXT, "batch_size": args.batch_size, "steps": args.steps, "max_lr": args.max_lr,
         "weight_decay": 0.01, "eval_interval": args.eval_interval, "start_from": START_FROM,
         "train_sequences": INPUT.size(0), "val_sequences": VAL_INPUT.size(0),
-        "train_tokens": INPUT.numel(), "val_tokens": VAL_INPUT.numel(),
+        "train_tokens": INPUT.numel(), "val_tokens": VAL_INPUT.numel(), 
         "steps_per_epoch": steps_per_epoch, "train_bytes_per_token": train_bpt, "val_bytes_per_token": val_bpt,
         "vocab": Transformer.TOKENS, "dim": Transformer.DIM, "layers": Transformer.LAYERS, "heads": Transformer.HEADS,
-        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "seed":SEED, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
@@ -144,32 +150,49 @@ def main():
         else:
             t = (step-int(.05*max_steps))/(max_steps-int(.05*max_steps)-1)
             return 1/2*max_lr*(1+math.cos(math.pi*t))
+        
+    def random_window_batch(inputs,context):
+        in_tokens = torch.flatten(inputs)
+        
+        shift_value = torch.randint(0,context,(1,1)).item()
+        in_shift = in_tokens[shift_value:]
+        
+        num_batches = (len(in_shift) - 1) // context
+        total_len = num_batches * context
 
+        inputs = in_shift[:total_len].view(num_batches, context).to(device)
+        targets = in_shift[1:total_len + 1].view(num_batches, context).to(device)
+        
+        idx = torch.randperm(num_batches, device=INPUT.device)
+        
+        inputs = inputs[idx]
+        targets = targets[idx]
+        
+        return inputs, targets
+        
     model.train()
     num_of_steps = 0
     epoch = 0
     stop = False
     run_eval(0, 0)
     while not stop:
-        idx = torch.randperm(INPUT.size(0), device=INPUT.device)
-        INPUT = INPUT[idx]
-        TARGET = TARGET[idx]
+        inpts, tgts = random_window_batch(INPUT,CONTEXT)
         epoch_loss = 0
         k = 0
-        for j in range(0, INPUT.size()[0], args.batch_size):
+        for j in range(0, inpts.size()[0], args.batch_size):
             if num_of_steps >= args.steps:
                 stop = True
                 break
             t0 = time.time()
             optimizer.param_groups[0]['lr'] = lr_decay(num_of_steps,args.steps,args.max_lr)
-            logits = model(INPUT[j:j+args.batch_size])
-            loss = torch.nn.functional.cross_entropy(logits.permute(0, 2, 1), TARGET[j:j+args.batch_size])
+            logits = model(inpts[j:j+args.batch_size])
+            loss = torch.nn.functional.cross_entropy(logits.permute(0, 2, 1), tgts[j:j+args.batch_size])
             model.zero_grad()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()  # measures, doesn't clip
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1).item()  # measures, doesn't clip
             optimizer.step()
             loss_val = loss.item()
-            tokens_seen += TARGET[j:j+args.batch_size].numel()
+            tokens_seen += tgts[j:j+args.batch_size].numel()
             num_of_steps += 1
             epoch_loss += loss_val
             k += 1
@@ -185,7 +208,7 @@ def main():
     train_f.close()
     eval_f.close()
 
-    # quick-look plot; the morning report does the fuller analysis from the CSVs
+    # quick-look plot; 
     steps, tr = [], []
     with open(os.path.join(run_dir, "train_steps.csv")) as f:
         for row in csv.DictReader(f):

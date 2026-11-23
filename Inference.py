@@ -4,12 +4,14 @@ from torch import nn
 from tokenizers import Tokenizer
 from pathlib import Path
 
-EXPERIMENT = 'Dropout'  #Name of the save file in weights. None defaults to the last file created
+EXPERIMENT = 'Random window batching'  #Name of the save file in weights. None defaults to the last file created
 
 USE_WEIGHTS = 'best' #best of experiment ("best"), or final output of experiment ("last")
 
 
 CONTEXT = 512
+
+TEMPERATURE = .8
 
 dt = torch.float32
 
@@ -29,7 +31,6 @@ def get_input():
     return (tokens,len_input)
 
 def main():
-    TEMPERATURE = .8
     softmax = Transformer.SoftMax.apply
     model = Transformer.Transformer().to(device)
     model.to(dtype=dt)
@@ -37,15 +38,14 @@ def main():
     model.eval()
     INPUT, word = get_input()
     INPUT = INPUT.unsqueeze(0)
-    sentence = ''
+    sentence = []
     with torch.inference_mode():
         for i in range(CONTEXT-word):
-            OUTPUT = softmax(model(INPUT)/TEMPERATURE).squeeze()
-            t = torch.multinomial(OUTPUT,1)
+            OUTPUT = softmax(model(INPUT)[:, -1, :]/TEMPERATURE).squeeze()
             next_word = torch.multinomial(OUTPUT,1)[-1]
             INPUT = torch.cat((INPUT,next_word.view(1,1)),dim=1)
-            sentence += tokenizer.decode([next_word.item()])
-    print(sentence)
+            sentence.append(next_word.item())
+    print(tokenizer.decode(sentence))
     
 if __name__ == "__main__":
     main()

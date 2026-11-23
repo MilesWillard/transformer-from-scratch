@@ -1,24 +1,27 @@
 from torch.autograd import gradcheck, gradgradcheck
 import torch
 
-class PositionalEncoding(torch.autograd.Function):
+class RMSNorm(torch.autograd.Function):
     @staticmethod
-    def forward(x):
-        context = x.size()[1]
-        dim = x.size()[2]
-        positions = torch.arange(context)[:, None]
-        dimensions = torch.arange(dim)[None, :]
-        angles = positions / (10000 ** (2 * (dimensions // 2) / dim))
-        pe = torch.where(dimensions % 2 == 0, torch.sin(angles), torch.cos(angles))
-        return x + pe
+    def forward(x, gamma, eps=1e-6):
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+        return x / rms * gamma, rms
     
     @staticmethod
     def setup_context(ctx,inputs,outputs):
-        pass
-    
+        out,rms = outputs
+        x, gamma = inputs[:2]
+        ctx.save_for_backward(x,gamma,rms)
+        ctx.mark_non_differentiable(rms)
+
     @staticmethod
-    def backward(ctx,grad_out):
-        return grad_out
+    def backward(ctx, g, g_rms):
+        x, gamma, rms = ctx.saved_tensors
+        d = x.size(-1)
+        gg = g * gamma
+        grad_x = gg / rms - x * (gg * x).sum(-1, keepdim=True) / (d * rms**3)
+        grad_gamma = (g * x / rms).reshape(-1, d).sum(0).reshape(gamma.shape)
+        return grad_x, grad_gamma, None
     
 # Always test with float64 — float32 noise masks gradient errors
 def verify_custom_function(func, *args):
@@ -37,4 +40,5 @@ def verify_custom_function(func, *args):
         print(f"Second-order gradcheck not applicable: {e}")
 
 x = torch.randn((2,3, 4), requires_grad=True)
-verify_custom_function(PositionalEncoding.apply, x)
+gamma = torch.ones((1,4),requires_grad=True)
+verify_custom_function(RMSNorm.apply, x,gamma)

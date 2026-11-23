@@ -17,8 +17,8 @@ The goal was to understand every piece of a modern language model well enough to
 | Activation | Softplus ("smooth ReLU") with a **hand-written backward pass** |
 | Positional encoding | Sinusoidal |
 | Tokenizer | Byte-level BPE, 2,000-token vocabulary (Hugging Face `tokenizers`) |
-| Training | AdamW, LR warmup + cosine decay, dropout, periodic evaluation, best/last checkpointing, CSV logs, loss plots |
-| Inference | Temperature sampling |
+| Training | AdamW, LR warmup + cosine decay, dropout, random-window batching, gradient clipping (max norm 1.0), `torch.compile`, periodic evaluation, best/last checkpointing, CSV logs, loss plots |
+| Inference | Temperature sampling (T = 0.8) from the last position |
 
 Each custom op is a `torch.autograd.Function` whose `backward` I derived on paper. For example, for RMSNorm y = γ · x / rms(x), the input gradient is
 
@@ -51,13 +51,16 @@ Same model and data, 3,000 steps each, now trained on an RTX 5070 (CUDA): the sa
 |---|---|---|
 | Baseline (constant LR) | 3.704 | 0.75 |
 | + LR warmup and cosine decay | 3.706 | 0.43 |
-| + Dropout 0.1 (attention and residual) | **3.673** | **0.21** |
+| + Dropout 0.1 (attention and residual) | 3.673 | 0.21 |
+| + Random-window batching | **3.655** | **0.11** |
 
 Warmup and cosine decay barely moved the best validation loss. Dropout gave the best result so far and cut the overfitting gap by more than two thirds, so it's now on by default. I also tried tying the input embedding and output layer weights; at this size it made results noticeably worse, so I've left it out for now and will retry it at GPT-2 scale.
 
+Random-window batching re-chunks the training tokens at a fresh random offset every epoch instead of reusing the same fixed 512-token chunks. On top of dropout it lowered the best validation loss again and roughly halved the remaining gap. Training loss went up slightly while validation loss went down, which is what a regularizer should do. The improvement is about the size of seed-to-seed noise at this scale, so I still want to confirm it with a second seed.
+
 ## Current work
 
-**Now:** finishing the Shakespeare model. Next up are random-window batching (sampling `(batch, context)` windows at random offsets instead of fixed chunks, as a cheap regularizer on such a small dataset), gradient clipping, a byte-level tokenizer alphabet so unseen characters never break encoding, a `tests/` script (gradcheck on every custom op, tokenizer round-trip, causal-mask check), and saving text samples with each run.
+**Now:** finishing the Shakespeare model. Since the last update I added random-window batching, turned on real gradient clipping, and reworked the custom autograd functions so the model runs under `torch.compile`. The sampler now produces play-formatted Shakespeare with speaker tags and mostly grammatical lines, though the meaning drifts. What's left: giving the tokenizer trainer the full byte-level alphabet so unseen characters never break encoding, and a second seed to confirm the random-window result.
 
 **Roadmap:** I'm working through a staged plan from this model toward a modern LLM:
 
@@ -74,6 +77,7 @@ Warmup and cosine decay barely moved the best validation loss. Dropout gave the 
 | `Training.py` | Training loop, evaluation, logging, checkpoints |
 | `Inference.py` | Generate text from a prompt |
 | `byte_pair_encoding.py` | Train the BPE tokenizer |
+| `test.py` | `gradcheck` harness for a custom autograd function |
 
 ## Running it
 
